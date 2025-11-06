@@ -1,95 +1,38 @@
+#include "stm32f4xx.h"
 #include "RccConfig.h"
+
+#include <stdint.h>      
 #include <stdlib.h>
 #include <string.h>
 
-#define CRSF_ADDRESS_FLIGHT_CONTROLLER 0XC8
-#define CRSF_FRAME_LENGTH 24
-#define CRSF_PACKET_SIZE 26
-#define CRSF_MAX_CHANNEL 16
-#define CRSF_PACKETTYPE_RC_CHANNELS_DATA 0X16
+#define CRSF_ADDRESS_FLIGHT_CONTROLLER 0XC8 //
+#define CRSF_FRAME_LENGTH 24 // x18
+#define CRSF_MAX_CHANNEL 16 //
+#define CRSF_PACKETTYPE_RC_CHANNELS_DATA 0X16 //
 
-uint8_t* inBuffer = NULL;
-uint8_t crsfData[CRSF_PACKET_SIZE];
+uint8_t inBuffer[CRSF_FRAME_LENGTH + 2];
+uint8_t crsfData[CRSF_FRAME_LENGTH + 2];
 uint16_t m_channels[CRSF_MAX_CHANNEL];
 
-uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len);
+volatile uint8_t DMA_buffer[52];
+volatile uint8_t packetLength, inData, addressByte;
+volatile uint8_t bufferIndex = 0;
+volatile uint8_t index_local = 0;
+volatile uint8_t index = 0;
 
+#define SER_PIN     0   // PD0 (DATA)
+#define SRCLK_PIN   1   // PD1 (SHIFT CLOCK)
+#define RCLK_PIN    2   // PD2 (LATCH)
+#define GPIO_PORT   GPIOD
 
-void GPIO_Config() {
-	
-	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
-	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN; 
-	RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
-	
-	//AF MODE FOR PA 8, 9, 10, 11 FOR TIMER
-	GPIOA->MODER |= (2 << GPIO_MODER_MODER8_Pos) | (2 << GPIO_MODER_MODER9_Pos) | (2 << GPIO_MODER_MODER10_Pos) | (2 << GPIO_MODER_MODER11_Pos);
-	
-	//AF MODE FOR PB7 (USART1_RX)
-	GPIOB->MODER |= (2 << GPIO_MODER_MODER7_Pos);
-	
-	// PD0-PD7 - 8 OUTPUTS FOR MOTORS (0-1 2-3 4-5 6-7)
-	GPIOD->MODER |= (1 << GPIO_MODER_MODER0_Pos) | (1 << GPIO_MODER_MODER1_Pos) | (1 << GPIO_MODER_MODER2_Pos) | (1 << GPIO_MODER_MODER3_Pos) |
-	(1 << GPIO_MODER_MODER4_Pos) | (1 << GPIO_MODER_MODER5_Pos) | (1 << GPIO_MODER_MODER6_Pos) | (1 << GPIO_MODER_MODER7_Pos);
-	
-	// AF TIM1 
-	GPIOA->AFR[1] |= (1 << GPIO_AFRH_AFSEL8_Pos) | (1 << GPIO_AFRH_AFSEL9_Pos) | (1 << GPIO_AFRH_AFSEL10_Pos) | (1 << GPIO_AFRH_AFSEL11_Pos);
+typedef enum {
+    STAGE_ADDRESS = 0,
+    STAGE_LENGTH = 1,
+    STAGE_TYPE = 2,
+    STAGE_PAYLOAD = 3
+} CRSF_Stage;
 
-	//AF 7 FOR USART1_RX (PB7)
-	GPIOB->AFR[0] |= (7 << GPIO_AFRL_AFSEL7_Pos);
-	
-	GPIOD->OSPEEDR |= 0x5555;
-}
-
-void TIMERS_Config() {
-	
-	RCC->APB2ENR |= RCC_APB2ENR_TIM1EN; // en clock
-	
-	TIM1->CR1 |= TIM_CR1_ARPE; // the auto-reload preload register ENABLE 
-	
-	TIM1->CCMR1 |= (6 << TIM_CCMR1_OC1M_Pos); // ‘110’ (PWM mode 1) for ch 1
-	TIM1->CCMR1 |= (6 << TIM_CCMR1_OC2M_Pos); // ‘110’ (PWM mode 1) for ch 2
-	TIM1->CCMR2 |= (6 << TIM_CCMR2_OC3M_Pos); // ‘110’ (PWM mode 1) for ch 3
-	TIM1->CCMR2 |= (6 << TIM_CCMR2_OC4M_Pos); // ‘110’ (PWM mode 1) for ch 4
-	
-	TIM1->PSC = 168 - 1;
-	TIM1->ARR = 49;
-	TIM1->CCR1 = 25;
-	TIM1->CCR2 = 25;
-	TIM1->CCR3 = 25;
-	TIM1->CCR4 = 25;
-	
-	
-	TIM1->CCMR1 |= TIM_CCMR1_OC1PE; //  CCR1 (for ch 1) preload register. preload value will be in queue and will not be taken in account immediately
-	TIM1->CCMR1 |= TIM_CCMR1_OC2PE;
-	TIM1->CCMR2 |= TIM_CCMR2_OC3PE;
-	TIM1->CCMR2 |= TIM_CCMR2_OC4PE;
-	
-	// output enable FOR PWM REACH PINS
-	TIM1->CCER |= TIM_CCER_CC1E;
-TIM1->CCER |= TIM_CCER_CC2E;
-TIM1->CCER |= TIM_CCER_CC3E;
-TIM1->CCER |= TIM_CCER_CC4E;
-
-TIM1->BDTR |= TIM_BDTR_MOE;
-TIM1->EGR |= TIM_EGR_UG; // As the preload registers are transferred to the shadow registers the user must initialize all the registers by setting the UG bit in the TIMx_EGR register.
-
-
-	TIM1->CR1 |= TIM_CR1_CEN; // en timer
-
-	while (!(TIM1->SR & TIM_SR_UIF)); // wait for flag to set
-
-}
-
-void USART1_Config() {
-	RCC->APB2ENR |= (1 << RCC_APB2ENR_USART1EN_Pos);
-	
-	USART1->BRR = 0x2D9; 
-	
-	USART1->CR1 |= (1 << USART_CR1_RE_Pos); // receiver en
-	
-	USART1->CR1 |= (1 << USART_CR1_UE_Pos); // EN USART
-
-}
+volatile CRSF_Stage crsfStage = STAGE_ADDRESS;
 
 uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len)
 {
@@ -121,9 +64,8 @@ uint8_t crsf_crc8(const uint8_t *ptr, uint8_t len)
 
 void updateChannels()
 {
-
   size_t bitOffset = 0;
-  
+
   for (size_t i = 0; i < 16; ++i) {
     size_t byteOffset = bitOffset / 8;
     size_t bitStart = bitOffset % 8;
@@ -138,73 +80,278 @@ void updateChannels()
   }
 }
 
-void handleCar() {
-    if (m_channels[1] > 1024) {
-        GPIOD->BSRR = (1 << GPIO_BSRR_BS0_Pos); 
-        GPIOD->BSRR = (1 << GPIO_BSRR_BR1_Pos);
-    } else if (m_channels[1] < 1024) {
-        GPIOD->BSRR = (1 << GPIO_BSRR_BR0_Pos); 
-        GPIOD->BSRR = (1 << GPIO_BSRR_BS1_Pos);
-    } else {
-        GPIOD->BSRR = (1 << GPIO_BSRR_BR0_Pos) | (1 << GPIO_BSRR_BR1_Pos);
-    }
+void shift_delay(void) {
+    for (volatile int i = 0; i < 200; i++);
 }
 
-int main () {
+void shiftOut(uint8_t data) {
+    for (int i = 7; i >= 0; i--) {
+        if (data & (1 << i))
+            GPIO_PORT->BSRR = (1U << SER_PIN);        // HIGH
+        else
+            GPIO_PORT->BSRR = (1U << (SER_PIN + 16)); // LOW
+
+        GPIO_PORT->BSRR = (1U << SRCLK_PIN);          // HIGH
+        shift_delay();
+        GPIO_PORT->BSRR = (1U << (SRCLK_PIN + 16));   // LOW
+        shift_delay();
+    }
+    // LATCH
+    GPIO_PORT->BSRR = (1U << RCLK_PIN);               // HIGH
+    shift_delay();
+    GPIO_PORT->BSRR = (1U << (RCLK_PIN + 16));        // LOW
+}
+
+void handleCar() {
+    if (m_channels[1] > 1024) {
+      //GPIOD->BSRR = GPIO_BSRR_BS12;
+			shiftOut(0b00100000);
+    }
+		if (m_channels[1] < 1024) {
+      //GPIOD->BSRR = GPIO_BSRR_BR12;
+			shiftOut(0b00010000);
+    }
+		
+}
+
+
+void GPIO_Config() {
+
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOAEN;
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
+  RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
+
+  //AF MODE FOR PA 8, 9, 10, 11 FOR TIMER
+  GPIOA->MODER |= (2 << GPIO_MODER_MODER8_Pos) | (2 << GPIO_MODER_MODER9_Pos) | (2 << GPIO_MODER_MODER10_Pos) | (2 << GPIO_MODER_MODER11_Pos);
+
+  //AF MODE FOR PB7 (USART1_RX)
+  GPIOB->MODER |= (2 << GPIO_MODER_MODER7_Pos);
+
+  // PD0-PD7 - 8 OUTPUTS FOR MOTORS (0-1 2-3 4-5 6-7)
+  GPIOD->MODER |= (1 << GPIO_MODER_MODER0_Pos) | (1 << GPIO_MODER_MODER1_Pos) | (1 << GPIO_MODER_MODER2_Pos) | (1 << GPIO_MODER_MODER3_Pos) |
+  (1 << GPIO_MODER_MODER4_Pos) | (1 << GPIO_MODER_MODER5_Pos) | (1 << GPIO_MODER_MODER6_Pos) | (1 << GPIO_MODER_MODER7_Pos) | (1 << GPIO_MODER_MODER12_Pos) ;
+
+  // AF TIM1
+  GPIOA->AFR[1] |= (1 << GPIO_AFRH_AFSEL8_Pos) | (1 << GPIO_AFRH_AFSEL9_Pos) | (1 << GPIO_AFRH_AFSEL10_Pos) | (1 << GPIO_AFRH_AFSEL11_Pos);
+
+  //AF 7 FOR USART1_RX (PB7)
+  GPIOB->AFR[0] |= (7 << GPIO_AFRL_AFSEL7_Pos);
+}
+
+void TIMERS_Config() {
+  
+  RCC->APB2ENR |= RCC_APB2ENR_TIM1EN; // en clock
+  
+  TIM1->CR1 |= TIM_CR1_ARPE; // the auto-reload preload register ENABLE 
+  
+  TIM1->CCMR1 |= (6 << TIM_CCMR1_OC1M_Pos); // ‘110’ (PWM mode 1) for ch 1
+  TIM1->CCMR1 |= (6 << TIM_CCMR1_OC2M_Pos); // ‘110’ (PWM mode 1) for ch 2
+  TIM1->CCMR2 |= (6 << TIM_CCMR2_OC3M_Pos); // ‘110’ (PWM mode 1) for ch 3
+  TIM1->CCMR2 |= (6 << TIM_CCMR2_OC4M_Pos); // ‘110’ (PWM mode 1) for ch 4
+  
+  TIM1->PSC = 168 - 1;
+  TIM1->ARR = 49;
+  TIM1->CCR1 = 25;
+  TIM1->CCR2 = 25;
+  TIM1->CCR3 = 25;
+  TIM1->CCR4 = 25;
+  
+  
+  TIM1->CCMR1 |= TIM_CCMR1_OC1PE; //  CCR1 (for ch 1) preload register. preload value will be in queue and will not be taken in account immediately
+  TIM1->CCMR1 |= TIM_CCMR1_OC2PE;
+  TIM1->CCMR2 |= TIM_CCMR2_OC3PE;
+  TIM1->CCMR2 |= TIM_CCMR2_OC4PE;
+  
+  // output enable FOR PWM REACH PINS
+  TIM1->CCER |= TIM_CCER_CC1E;
+	TIM1->CCER |= TIM_CCER_CC2E;
+	TIM1->CCER |= TIM_CCER_CC3E;
+	TIM1->CCER |= TIM_CCER_CC4E;
+
+	TIM1->BDTR |= TIM_BDTR_MOE;
+	TIM1->EGR |= TIM_EGR_UG; // As the preload registers are transferred to the shadow registers the user must initialize all the registers by setting the UG bit in the TIMx_EGR register.
+
+  TIM1->CR1 |= TIM_CR1_CEN; // en timer
+}
+
+
+void USART1_Config() {
+  RCC->APB2ENR |= (1 << RCC_APB2ENR_USART1EN_Pos);
+
+  USART1->BRR = 0x2D9;
+
+  USART1->CR1 |= (1 << USART_CR1_RE_Pos); // receiver en
 	
-	SysClockConfig ();
-	GPIO_Config();
-	USART1_Config();
-	TIMERS_Config();
+	USART1->CR3 |= (1 << USART_CR3_DMAR_Pos); // DMA enable receiver
+
+  USART1->CR1 |= (1 << USART_CR1_UE_Pos); // EN USART
+
+}
+
+void DMA2_Config (uint8_t *address) {
+
+	RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN;
 	
-while (1){
+	DMA2_Stream2->CR |= (4 << DMA_SxCR_CHSEL_Pos); // channel 4
 	
-	uint8_t packetLength, inData, bufferIndex = 0;
-	while (USART1->SR & USART_SR_RXNE){
-	inData = USART1->DR;
-		if (bufferIndex == 0) {
-			if (inData == CRSF_ADDRESS_FLIGHT_CONTROLLER) {
-				uint8_t addressByte = inData;
-					if (USART1->SR & USART_SR_RXNE){
-						inData = USART1->DR;
-						packetLength = inData;
-						if (USART1->SR & USART_SR_RXNE){
-							inData = USART1->DR;
-							if (inData != CRSF_PACKETTYPE_RC_CHANNELS_DATA) {
-							bufferIndex = 0;
-							continue;
-							}
-							uint8_t inBuffer[CRSF_PACKET_SIZE + 2];
+	DMA2_Stream2->CR |= (1 << DMA_SxCR_TCIE_Pos); // Transfer complete interrupt enable (FOR TX AND RX)
+	
+	DMA2_Stream2->CR |= (1 << DMA_SxCR_HTIE_Pos); // Half transfer interrupt enable (FOR TX AND RX)
+	
+	DMA2_Stream2->CR |= (1 << DMA_SxCR_MINC_Pos); // Memory increment mode
+	
+	DMA2_Stream2->CR |= (1 << DMA_SxCR_CIRC_Pos); // Circular mode
+	
+	NVIC_SetPriority(DMA2_Stream2_IRQn, 1); 
+	
+	NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+	
+	DMA2_Stream2->CR |= (3 << DMA_SxCR_PL_Pos); //  Priority level
+
+  /* 00: Low, 01: Medium, 10: High, 11: Very high */
+	
+	DMA2_Stream2->CR &= ~(3 << DMA_SxCR_DIR_Pos); // Data transfer direction - Peripheral-to-memory
+	
+	/* 00: Peripheral-to-memory, 01: Memory-to-peripheral, 10: Memory-to-memory*/ 
+	
+	DMA2_Stream2->NDTR = 52; // Number of data items to transfer
+	
+	DMA2_Stream2->PAR = (uint32_t)&USART1->DR; // Peripheral address
+
+	DMA2_Stream2->M0AR = (uint32_t)address; // Memory address
+	
+	DMA2_Stream2->CR |= DMA_SxCR_EN;
+}
+
+void DMA2_Stream2_IRQHandler(void) {
+	
+   if (DMA2->LISR & DMA_LISR_TCIF2) // Transfer complete
+	  {
+			DMA2->LIFCR = DMA_LIFCR_CTCIF2;
+			index = 26;
+			while (index != 52) {
+			switch (crsfStage) {
+				case STAGE_ADDRESS:   // 0
+					inData = DMA_buffer[index++];
+					if (inData == CRSF_ADDRESS_FLIGHT_CONTROLLER) {
+						addressByte = inData;
+						crsfStage = STAGE_LENGTH;
+						break;
+					}	else break;
+
+				case STAGE_LENGTH:    // 1 ?
+					inData = DMA_buffer[index++];
+						if (inData == CRSF_FRAME_LENGTH) {
+							packetLength = inData;
+							crsfStage = STAGE_TYPE;
+							break;
+						} else break;
+
+				case STAGE_TYPE:      // 2
+					inData = DMA_buffer[index++];
+						if (inData == CRSF_PACKETTYPE_RC_CHANNELS_DATA) {
 							inBuffer[bufferIndex++] = addressByte;
 							inBuffer[bufferIndex++] = packetLength;
 							inBuffer[bufferIndex++] = inData;
+							crsfStage = STAGE_PAYLOAD;
+							break;
+						} else break;
+					
+
+				case STAGE_PAYLOAD:   // 3
+						 if (bufferIndex < packetLength + 1) {
+						inData = DMA_buffer[index++];
+							inBuffer[bufferIndex++] = inData;
+							 break;
+							} else if (bufferIndex == packetLength + 1) { 
+									inData = DMA_buffer[index++];
+									inBuffer[bufferIndex++] = inData;
+									uint8_t crc = crsf_crc8(&inBuffer[2], inBuffer[1] - 1);
+									if (crc == inBuffer[packetLength + 1]) {
+											memcpy(crsfData, inBuffer, packetLength + 2);
+											updateChannels();
+											handleCar();
+											bufferIndex = 0;
+										  break;
+										} else {
+										crsfStage = STAGE_ADDRESS;
+										break;
+										}
 						}
-					}
-			} else { // skip
-        uint8_t length = USART1->DR;
-        for (int i = 0; i < length - 1; i++) {
-          USART1->DR;
-        }
-        bufferIndex = 0;
-        continue;
-      }
-			
-		} else if (bufferIndex > 1 && bufferIndex < packetLength + 1) {
-      inBuffer[bufferIndex++] = inData;
+				}
 			}
-			else if (bufferIndex == packetLength + 1) {
-      inBuffer[bufferIndex++] = inData;
-      uint8_t crc = crsf_crc8(&inBuffer[2], inBuffer[1] - 1);
-      if (crc == inBuffer[packetLength + 1]) {
-        memcpy(crsfData, inBuffer, packetLength + 2);
-        updateChannels();
-        handleCar();
-      }
-      inBuffer = NULL;
-      bufferIndex = 0;
-      packetLength = 0;
+    }
+		
+		if (DMA2->LISR & DMA_LISR_HTIF2)// Half complete
+    {
+			DMA2->LIFCR = DMA_LIFCR_CHTIF2;
+			index = 0;
+			while (index != 26) {
+				switch (crsfStage) {
+				case STAGE_ADDRESS:   // 0
+					inData = DMA_buffer[index++];
+					if (inData == CRSF_ADDRESS_FLIGHT_CONTROLLER) {
+						addressByte = inData;
+						crsfStage = STAGE_LENGTH;
+						break;
+					}	else break;
+
+				case STAGE_LENGTH:    // 1 ?
+					inData = DMA_buffer[index++];
+						if (inData == CRSF_FRAME_LENGTH) {
+							packetLength = inData;
+							crsfStage = STAGE_TYPE;
+							break;
+						} else break;
+
+				case STAGE_TYPE:      // 2
+					inData = DMA_buffer[index++];
+						if (inData == CRSF_PACKETTYPE_RC_CHANNELS_DATA) {
+							inBuffer[bufferIndex++] = addressByte;
+							inBuffer[bufferIndex++] = packetLength;
+							inBuffer[bufferIndex++] = inData;
+							crsfStage = STAGE_PAYLOAD;
+							break;
+						} else break;
+					
+
+				case STAGE_PAYLOAD:   // 3
+						 if (bufferIndex < packetLength + 1) {
+						 inData = DMA_buffer[index++];
+							inBuffer[bufferIndex++] = inData;
+							break;
+							} else if (bufferIndex == packetLength + 1) { 
+						inData = DMA_buffer[index++];
+						inBuffer[bufferIndex++] = inData;
+						uint8_t crc = crsf_crc8(&inBuffer[2], inBuffer[1] - 1);
+							if (crc == inBuffer[packetLength + 1]) {
+									memcpy(crsfData, inBuffer, packetLength + 2);
+									updateChannels();
+									handleCar();
+							    bufferIndex = 0;
+								  crsfStage = STAGE_ADDRESS;
+								break;
+								} else {
+								bufferIndex = 0;
+								crsfStage = STAGE_ADDRESS;
+								break;
+								}
+						}
+				}
+			}
     }
 }
 
+int main(void) {
+  
+    SysClockConfig ();
+    GPIO_Config();
+	  DMA2_Config (DMA_buffer);
+	  TIMERS_Config();
+    USART1_Config();
+
+while (1){
+
+  
 }
 }
